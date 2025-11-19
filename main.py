@@ -136,6 +136,35 @@ def _ensure_gtfs_loaded() -> None:
 BUS_API_BASE = os.getenv("BUS_API_BASE", "https://busapi.59.ae")
 
 
+def _guess_eta_minutes(value: Any) -> Optional[int]:
+    """Heuristic to convert various ETA representations to minutes.
+    - If value is None -> None
+    - If int/float and <= 180 -> treat as minutes
+    - If int/float and > 180 -> treat as seconds and convert to minutes
+    - If string like "5m" or "5" -> best-effort parse
+    """
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            v = value.strip().lower().replace("min", "").replace("m", "").replace("minutes", "").strip()
+            if v.endswith("s"):
+                # seconds like "120s"
+                v = v[:-1]
+                seconds = float(v)
+                return int(round(seconds / 60))
+            num = float(v)
+            # assume minutes for plain numbers
+            return int(round(num))
+        if isinstance(value, (int, float)):
+            if value <= 180:
+                return int(round(value))
+            return int(round(value / 60))
+    except Exception:
+        return None
+    return None
+
+
 def fetch_live_for_stop(stop_id: str) -> List[Dict[str, Any]]:
     """
     Try a few common patterns to get live vehicles approaching a stop.
@@ -144,6 +173,7 @@ def fetch_live_for_stop(stop_id: str) -> List[Dict[str, Any]]:
     If nothing is available, returns [].
     """
     endpoints = [
+        f"{BUS_API_BASE}/api/stop/{stop_id}",  # user-reported endpoint
         f"{BUS_API_BASE}/realtime/stop/{stop_id}",
         f"{BUS_API_BASE}/stop/{stop_id}/realtime",
         f"{BUS_API_BASE}/stop/{stop_id}/vehicles",
@@ -161,56 +191,67 @@ def fetch_live_for_stop(stop_id: str) -> List[Dict[str, Any]]:
             if isinstance(data, list):
                 raw_list = data
             elif isinstance(data, dict):
-                # Pick the first list-like field
-                raw_list = None
-                for k in ("vehicles", "arrivals", "results", "data"):
+                # Prefer keys commonly used for this API
+                for k in ("results", "trips", "vehicles", "arrivals", "data", "items"):
                     if isinstance(data.get(k), list):
                         raw_list = data.get(k)
                         break
-                if raw_list is None:
-                    # Try nested
+                else:
+                    # fallback: any first list value
+                    raw_list = []
                     for v in data.values():
                         if isinstance(v, list):
                             raw_list = v
                             break
-                    if raw_list is None:
-                        raw_list = []
             else:
                 raw_list = []
 
             for v in raw_list:
-                route_id = v.get("route_id") or v.get("routeId") or v.get("route")
-                trip_id = v.get("trip_id") or v.get("tripId") or v.get("trip")
-                # ETA
-                eta_sec = None
-                for k in ("eta_sec", "eta", "eta_seconds", "etaSeconds"):
-                    if k in v and isinstance(v[k], (int, float)):
-                        eta_sec = int(v[k])
-                        break
-                if eta_sec is None:
-                    # maybe provided as minutes
-                    for k in ("eta_min", "etaMinutes"):
-                        if k in v and isinstance(v[k], (int, float)):
-                            eta_sec = int(v[k] * 60)
-                            break
-                eta_min = int(round(eta_sec / 60)) if eta_sec is not None else None
+                # IDs
+                route_id = v.get("route_id") or v.get("routeId") or v.get("route") or v.get("routeShortName")
+                trip_id = v.get("trip_id") or v.get("tripId") or v.get("trip") or v.get("trip_id_str")
 
-                # Occupancy
-                occupancy = v.get("occupancy") or v.get("load") or v.get("occupancy_percentage")
+                # ETA handling: look across multiple keys
+                eta_min: Optional[int] = None
+                if any(k in v for k in ("eta_min", "etaMinutes", "eta_mins")):
+                    for k in ("eta_min", "etaMinutes", "eta_mins"):
+                        if k in v:
+                            eta_min = _guess_eta_minutes(v[k])
+                            break
+                elif any(k in v for k in ("eta_sec", "eta", "eta_seconds", "etaSeconds")):
+                    for k in ("eta_sec", "eta", "eta_seconds", "etaSeconds"):
+                        if k in v:
+                            eta_min = _guess_eta_minutes(v[k])
+                            break
+                elif "arrival_in" in v:
+                    eta_min = _guess_eta_minutes(v.get("arrival_in"))
+
+                # Occupancy / load
+                occupancy = (
+                    v.get("occupancy")
+                    or v.get("load")
+                    or v.get("occupancy_percentage")
+                    or v.get("loadPercent")
+                    or v.get("passenger_load")
+                )
                 if isinstance(occupancy, str):
-                    # try to parse percentage from string
                     try:
                         if occupancy.endswith("%"):
                             occupancy = float(occupancy.strip("% "))
+                        else:
+                            occupancy = float(occupancy)
                     except Exception:
                         occupancy = None
 
                 # Delay
-                delay_min = None
-                for k in ("delay_sec", "delay", "delaySeconds"):
+                delay_val = None
+                for k in ("delay_sec", "delay", "delaySeconds", "lateness"):
                     if k in v and isinstance(v[k], (int, float)):
-                        delay_min = int(round(v[k] / 60))
+                        delay_val = v[k]
                         break
+                delay_min = None
+                if delay_val is not None:
+                    delay_min = int(round(delay_val / 60)) if delay_val > 180 else int(round(delay_val))
 
                 items.append(
                     {
@@ -221,7 +262,8 @@ def fetch_live_for_stop(stop_id: str) -> List[Dict[str, Any]]:
                         "delay_min": delay_min,
                     }
                 )
-            return items
+            if items:
+                return items
         except Exception:
             continue
     return []
